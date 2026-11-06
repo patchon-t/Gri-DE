@@ -48,8 +48,11 @@ struct wlr_xdg_toplevel;
 struct wlr_xdg_toplevel_decoration_v1;
 struct wlr_xwayland;
 struct wlr_xwayland_surface;
+struct draw_buffer;
 struct gride_deco;
+struct gride_flyout;
 struct gride_grid_overlay;
+struct gride_ipc;
 
 /* ---- sizes from the design spec that tokens.json does not carry --------- */
 
@@ -61,6 +64,15 @@ struct gride_grid_overlay;
 #define GRIDE_SNAP_DURATION_MS 180
 /* Invisible band outside a decorated window where dragging resizes it. */
 #define GRIDE_RESIZE_BORDER 6
+/* Hovering Maximise this long opens the snap layouts flyout. */
+#define GRIDE_SNAP_FLYOUT_HOVER_MS 400
+#define GRIDE_SNAP_FLYOUT_WIDTH 380
+/* Workspaces form a 3x3 grid. */
+#define GRIDE_WORKSPACE_COLUMNS 3
+#define GRIDE_WORKSPACE_ROWS 3
+#define GRIDE_WORKSPACES (GRIDE_WORKSPACE_COLUMNS * GRIDE_WORKSPACE_ROWS)
+#define GRIDE_GRID_MAX_COLUMNS 8
+#define GRIDE_GRID_MAX_ROWS 6
 
 enum gride_cursor_mode {
 	GRIDE_CURSOR_PASSTHROUGH,
@@ -71,6 +83,8 @@ enum gride_cursor_mode {
 	/* Pressed on a title bar or with Super: becomes a move or resize once
 	 * the pointer travels a few pixels, so a plain click stays a click. */
 	GRIDE_CURSOR_PENDING,
+	/* Dragging across cells in the snap layouts flyout's cell picker. */
+	GRIDE_CURSOR_FLYOUT,
 };
 
 enum gride_grid_mode {
@@ -142,7 +156,8 @@ struct gride_server {
 	 *   background  desktop fill and dot grid, one node per output
 	 *   windows     one gride_view tree per window; popups nest inside
 	 *   unmanaged   X11 menus and tooltips (override-redirect windows)
-	 *   overlay     the grid drag overlay; flyouts in phase 3
+	 *   overlay     the grid drag overlay and the snap preview
+	 *   flyouts     the snap layouts flyout
 	 * The trees are owned by the scene and destroyed with it.
 	 */
 	struct wlr_scene *scene;
@@ -152,6 +167,7 @@ struct gride_server {
 		struct wlr_scene_tree *windows;
 		struct wlr_scene_tree *unmanaged;
 		struct wlr_scene_tree *overlay;
+		struct wlr_scene_tree *flyouts;
 	} layers;
 
 	struct wlr_output_layout *output_layout;
@@ -215,10 +231,25 @@ struct gride_server {
 	uint32_t last_title_click_msec;
 	struct gride_view *last_title_click_view;
 
-	/* The grid. */
+	/* The grid. Starts from the options; gride-msg can change it. */
+	int grid_columns, grid_rows;
+	enum gride_grid_mode grid_mode;
 	struct gride_grid_overlay *grid_overlay; /* non-NULL while dragging */
+	struct wlr_scene_buffer *grid_preview;   /* snap target preview, or NULL */
 	struct wl_event_source *anim_timer;
 	int animating; /* views with a running snap animation */
+
+	/* Workspaces: one 3x3 set shared by all outputs. */
+	int workspace;                          /* current, 0..8 */
+	char *workspace_names[GRIDE_WORKSPACES]; /* NULL = unnamed */
+	struct gride_view *workspace_focus[GRIDE_WORKSPACES]; /* last focused */
+
+	struct gride_flyout *flyout;            /* the open snap layouts flyout */
+	struct wl_event_source *flyout_timer;   /* hover-to-open and hover-to-close */
+	struct gride_view *flyout_hover_view;   /* Maximise hovered, timer running */
+
+	struct gride_ipc *ipc;
+	uint32_t next_view_id;
 
 	struct wl_event_source *sigint_source;
 	struct wl_event_source *sigterm_source;
@@ -277,6 +308,8 @@ struct gride_view {
 	enum gride_view_type type;
 	const struct gride_view_impl *impl;
 	struct wlr_surface *surface;         /* set while mapped */
+	uint32_t id;                         /* stable id for gride-msg */
+	int workspace;                       /* 0..8 */
 
 	struct wlr_scene_tree *scene_tree;   /* ours; node.data = this view */
 	struct wlr_scene_tree *content_tree; /* holds the client's surfaces */
@@ -370,6 +403,9 @@ void view_hit_test(struct gride_server *server, double lx, double ly, struct gri
 struct gride_view *view_from_surface(struct gride_server *server, struct wlr_surface *surface);
 void views_arrange(struct gride_server *server);
 void views_redraw_decorations(struct gride_server *server);
+struct gride_view *view_by_id(struct gride_server *server, uint32_t id);
+struct wlr_output *view_get_output(struct gride_view *view);
+void view_maximize_button_box(struct gride_view *view, struct wlr_box *box);
 
 /* xdg.c */
 void xdg_handle_new_toplevel(struct wl_listener *listener, void *data);
@@ -389,6 +425,11 @@ void deco_set_pressed(struct gride_deco *deco, enum gride_deco_part part);
 enum gride_deco_part deco_part_at(struct gride_deco *deco, double fx, double fy);
 bool deco_owns_node(struct gride_deco *deco, struct wlr_scene_node *node);
 void deco_init_shared(struct gride_server *server);
+/* The shadow-float token around a w x h rounded shape, as a scale-1 buffer
+ * padded by shadow_reach() on every side. */
+struct draw_buffer *shadow_render(int w, int h, double radius,
+	const struct gride_shadow_layer *layers);
+int shadow_reach(const struct gride_shadow_layer *layers);
 void deco_finish_shared(void);
 
 /* grid.c */
@@ -409,7 +450,41 @@ void grid_drag_begin(struct gride_server *server, struct gride_view *view);
 void grid_drag_update(struct gride_server *server);
 void grid_drag_end(struct gride_server *server, bool snap);
 void grid_output_removed(struct gride_server *server, struct wlr_output *output);
+void grid_preview_show(struct gride_server *server, struct wlr_output *output,
+	const struct gride_range *range);
+void grid_preview_hide(struct gride_server *server);
+bool grid_parse_range(struct gride_server *server, const char *text, struct gride_range *range);
+bool grid_set_size(struct gride_server *server, int columns, int rows);
+void grid_set_mode(struct gride_server *server, enum gride_grid_mode mode);
 void grid_finish(struct gride_server *server);
+
+/* workspace.c */
+void workspace_switch(struct gride_server *server, int index);
+void workspace_switch_direction(struct gride_server *server, int dx, int dy);
+void workspace_move_view(struct gride_view *view, int index);
+bool view_on_current_workspace(struct gride_view *view);
+int workspace_window_count(struct gride_server *server, int index);
+const char *workspace_name(struct gride_server *server, int index);
+void workspace_set_name(struct gride_server *server, int index, const char *name);
+void workspace_finish(struct gride_server *server);
+
+/* flyout.c: the snap layouts flyout */
+void flyout_open(struct gride_view *view);
+void flyout_close(struct gride_server *server);
+bool flyout_contains(struct gride_server *server, double lx, double ly);
+void flyout_pointer_motion(struct gride_server *server, double lx, double ly);
+bool flyout_pointer_button(struct gride_server *server, double lx, double ly, bool pressed);
+bool flyout_handle_key(struct gride_server *server, xkb_keysym_t sym);
+void flyout_hover_maximize(struct gride_server *server, struct gride_view *view);
+void flyout_view_gone(struct gride_server *server, struct gride_view *view);
+void flyout_finish(struct gride_server *server);
+
+/* ipc.c: $XDG_RUNTIME_DIR/gride.sock */
+bool ipc_init(struct gride_server *server);
+void ipc_finish(struct gride_server *server);
+void ipc_event_window(struct gride_server *server, struct gride_view *view, const char *change);
+void ipc_event_workspace(struct gride_server *server);
+void ipc_event_grid(struct gride_server *server);
 
 /* input.c */
 void input_init(struct gride_server *server);

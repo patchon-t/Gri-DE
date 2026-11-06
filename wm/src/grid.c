@@ -24,8 +24,6 @@
 #include "draw.h"
 #include "server.h"
 
-#define GRID_MAX_COLUMNS 8
-#define GRID_MAX_ROWS 6
 #define ANIM_TICK_MS 10
 
 struct gride_grid_overlay {
@@ -39,11 +37,11 @@ struct gride_grid_overlay {
 };
 
 static int columns(struct gride_server *server) {
-	return server->opts->grid_columns;
+	return server->grid_columns;
 }
 
 static int rows(struct gride_server *server) {
-	return server->opts->grid_rows;
+	return server->grid_rows;
 }
 
 void grid_area(struct gride_server *server, struct wlr_output *output, struct wlr_box *area) {
@@ -304,6 +302,7 @@ void grid_snap_view(struct gride_view *view, struct wlr_output *output,
 	if (view->deco) {
 		deco_update(view->deco);
 	}
+	ipc_event_window(server, view, "snap");
 }
 
 void grid_unsnap_view(struct gride_view *view) {
@@ -327,11 +326,11 @@ bool grid_auto_place(struct gride_view *view, struct wlr_output *output) {
 		return false;
 	}
 	int nc = columns(server), nr = rows(server);
-	bool used[GRID_MAX_ROWS][GRID_MAX_COLUMNS] = {{false}};
+	bool used[GRIDE_GRID_MAX_ROWS][GRIDE_GRID_MAX_COLUMNS] = {{false}};
 	struct gride_view *other;
 	wl_list_for_each(other, &server->views, link) {
 		if (other == view || !other->mapped || other->minimized || !other->snapped ||
-				other->snap_output != output) {
+				other->snap_output != output || !view_on_current_workspace(other)) {
 			continue;
 		}
 		for (int r = other->range.r0; r <= other->range.r1; r++) {
@@ -376,7 +375,7 @@ bool grid_auto_place(struct gride_view *view, struct wlr_output *output) {
 	int victim_area = 0;
 	wl_list_for_each(other, &server->views, link) {
 		if (other == view || !other->mapped || other->minimized || !other->snapped ||
-				other->snap_output != output) {
+				other->snap_output != output || !view_on_current_workspace(other)) {
 			continue;
 		}
 		int w = other->range.c1 - other->range.c0 + 1;
@@ -508,18 +507,20 @@ static void draw_cells(struct gride_server *server, struct gride_grid_overlay *o
 	draw_buffer_drop(buf);
 }
 
-static void draw_target(struct gride_server *server, struct gride_grid_overlay *ov,
-		const struct gride_range *range) {
+/* The snap target: a 2px accent outline over accent-tint with the ink chip
+ * ("A1:B3 · Left half") in the middle. Used by the drag overlay and by the
+ * snap layouts flyout's preview. */
+static void render_target(struct gride_server *server, struct wlr_output *output,
+		const struct gride_range *range, struct wlr_scene_buffer *node) {
 	struct wlr_box box;
-	grid_range_box(server, ov->output, range, &box);
-	struct draw_buffer *buf = draw_buffer_create(box.width, box.height, ov->output->scale);
+	grid_range_box(server, output, range, &box);
+	struct draw_buffer *buf = draw_buffer_create(box.width, box.height, output->scale);
 	if (!buf) {
 		return;
 	}
 	cairo_t *cr = buf->cr;
 	const struct gride_palette *p = server->palette;
 
-	/* 2px accent outline over accent-tint, with the window radius. */
 	draw_rounded_rect(cr, 1, 1, box.width - 2, box.height - 2, GRIDE_RADIUS_MD);
 	draw_set_color(cr, p->accent_tint);
 	cairo_fill_preserve(cr);
@@ -531,7 +532,7 @@ static void draw_target(struct gride_server *server, struct gride_grid_overlay *
 	char ids[16], name[48], markup[160];
 	grid_range_label(server, range, ids, sizeof(ids), name, sizeof(name));
 	snprintf(markup, sizeof(markup), "<span font_family=\"%s\" font_weight=\"%d\">%s</span>"
-		"  ·  %s", gride_type_mono.family, gride_type_mono.weight, ids, name);
+		"  \u00b7  %s", gride_type_mono.family, gride_type_mono.weight, ids, name);
 	PangoLayout *layout = draw_text_layout(cr, &gride_type_label, markup, true, 0);
 	int tw, tht;
 	draw_text_size(layout, &tw, &tht);
@@ -546,11 +547,34 @@ static void draw_target(struct gride_server *server, struct gride_grid_overlay *
 	pango_cairo_show_layout(cr, layout);
 	g_object_unref(layout);
 
-	wlr_scene_buffer_set_buffer(ov->target, buf->base);
-	wlr_scene_buffer_set_dest_size(ov->target, box.width, box.height);
-	wlr_scene_node_set_position(&ov->target->node, box.x, box.y);
-	wlr_scene_node_set_enabled(&ov->target->node, true);
+	wlr_scene_buffer_set_buffer(node, buf->base);
+	wlr_scene_buffer_set_dest_size(node, box.width, box.height);
+	wlr_scene_node_set_position(&node->node, box.x, box.y);
+	wlr_scene_node_set_enabled(&node->node, true);
 	draw_buffer_drop(buf);
+}
+
+static void draw_target(struct gride_server *server, struct gride_grid_overlay *ov,
+		const struct gride_range *range) {
+	render_target(server, ov->output, range, ov->target);
+}
+
+void grid_preview_show(struct gride_server *server, struct wlr_output *output,
+		const struct gride_range *range) {
+	if (!output) {
+		return;
+	}
+	if (!server->grid_preview) {
+		server->grid_preview = wlr_scene_buffer_create(server->layers.overlay, NULL);
+	}
+	render_target(server, output, range, server->grid_preview);
+}
+
+void grid_preview_hide(struct gride_server *server) {
+	if (server->grid_preview) {
+		wlr_scene_node_destroy(&server->grid_preview->node);
+		server->grid_preview = NULL;
+	}
 }
 
 static void overlay_destroy(struct gride_server *server) {
@@ -658,8 +682,71 @@ void grid_output_removed(struct gride_server *server, struct wlr_output *output)
 	}
 }
 
+bool grid_parse_range(struct gride_server *server, const char *text, struct gride_range *range) {
+	char c0, c1;
+	int r0, r1, n = 0;
+	char extra;
+	if (sscanf(text, " %c%d:%c%d %c", &c0, &r0, &c1, &r1, &extra) == 4) {
+		n = 4;
+	} else if (sscanf(text, " %c%d %c", &c0, &r0, &extra) == 2) {
+		c1 = c0;
+		r1 = r0;
+		n = 2;
+	}
+	if (!n) {
+		return false;
+	}
+	c0 = (char)(c0 >= 'a' ? c0 - 'a' + 'A' : c0);
+	c1 = (char)(c1 >= 'a' ? c1 - 'a' + 'A' : c1);
+	struct gride_range r = { c0 - 'A', r0 - 1, c1 - 'A', r1 - 1 };
+	if (r.c0 < 0 || r.c1 < 0 || r.c0 >= columns(server) || r.c1 >= columns(server) ||
+			r.r0 < 0 || r.r1 < 0 || r.r0 >= rows(server) || r.r1 >= rows(server)) {
+		return false;
+	}
+	clamp_range(server, &r); /* puts the corners in order */
+	*range = r;
+	return true;
+}
+
+bool grid_set_size(struct gride_server *server, int cols, int nrows) {
+	if (cols < 1 || cols > GRIDE_GRID_MAX_COLUMNS || nrows < 1 || nrows > GRIDE_GRID_MAX_ROWS) {
+		return false;
+	}
+	if (cols == columns(server) && nrows == rows(server)) {
+		return true;
+	}
+	overlay_destroy(server);
+	grid_preview_hide(server);
+	flyout_close(server);
+	server->grid_columns = cols;
+	server->grid_rows = nrows;
+	/* Snapped windows move to the cells nearest to where they are now. */
+	struct gride_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		if (!view->snapped || !view->snap_output) {
+			continue;
+		}
+		struct wlr_box frame;
+		view_get_frame(view, &frame);
+		struct gride_range range;
+		grid_nearest_range(server, view->snap_output, &frame, &range);
+		grid_snap_view(view, view->snap_output, &range, view_on_current_workspace(view));
+	}
+	wlr_log(WLR_INFO, "Grid is now %d x %d", cols, nrows);
+	ipc_event_grid(server);
+	return true;
+}
+
+void grid_set_mode(struct gride_server *server, enum gride_grid_mode mode) {
+	if (server->grid_mode != mode) {
+		server->grid_mode = mode;
+		ipc_event_grid(server);
+	}
+}
+
 void grid_finish(struct gride_server *server) {
 	overlay_destroy(server);
+	grid_preview_hide(server);
 	if (server->anim_timer) {
 		wl_event_source_remove(server->anim_timer);
 		server->anim_timer = NULL;

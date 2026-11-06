@@ -25,6 +25,8 @@ void view_init(struct gride_view *view, struct gride_server *server,
 	view->server = server;
 	view->type = type;
 	view->impl = impl;
+	view->id = ++server->next_view_id;
+	view->workspace = server->workspace;
 	wl_list_init(&view->link);
 	wl_list_init(&view->minimized_link);
 	/*
@@ -53,6 +55,12 @@ void view_destroy(struct gride_view *view) {
 	if (server->hover_view == view) {
 		server->hover_view = NULL;
 	}
+	for (int i = 0; i < GRIDE_WORKSPACES; i++) {
+		if (server->workspace_focus[i] == view) {
+			server->workspace_focus[i] = NULL;
+		}
+	}
+	flyout_view_gone(server, view);
 	if (view->anim.active) {
 		view->anim.active = false;
 		server->animating--;
@@ -150,6 +158,9 @@ void view_title_changed(struct gride_view *view) {
 	if (view->deco) {
 		deco_update(view->deco);
 	}
+	if (view->mapped) {
+		ipc_event_window(view->server, view, "title");
+	}
 }
 
 bool view_is_terminal(struct gride_view *view) {
@@ -182,7 +193,7 @@ bool view_is_snappable(struct gride_view *view) {
 	return true;
 }
 
-static struct wlr_output *view_output(struct gride_view *view) {
+struct wlr_output *view_get_output(struct gride_view *view) {
 	if (view->snapped && view->snap_output) {
 		return view->snap_output;
 	}
@@ -207,6 +218,10 @@ void view_focus(struct gride_view *view) {
 		return;
 	}
 	struct gride_server *server = view->server;
+	if (!view_on_current_workspace(view)) {
+		/* Something asked to focus a window elsewhere: go there. */
+		workspace_switch(server, view->workspace);
+	}
 	struct gride_view *prev = server->focused_view;
 	view_raise(view);
 	if (prev == view && server->seat->keyboard_state.focused_surface == view->surface) {
@@ -221,6 +236,7 @@ void view_focus(struct gride_view *view) {
 		}
 	}
 	server->focused_view = view;
+	server->workspace_focus[view->workspace] = view;
 	view->impl->set_activated(view, true);
 	if (view->deco) {
 		deco_update(view->deco);
@@ -235,12 +251,13 @@ void view_focus(struct gride_view *view) {
 	} else {
 		wlr_seat_keyboard_notify_enter(server->seat, view->surface, NULL, 0, NULL);
 	}
+	ipc_event_window(server, view, "focus");
 }
 
 static void focus_next(struct gride_server *server) {
 	struct gride_view *next;
 	wl_list_for_each(next, &server->views, link) {
-		if (next->mapped && !next->minimized) {
+		if (next->mapped && !next->minimized && view_on_current_workspace(next)) {
 			view_focus(next);
 			return;
 		}
@@ -327,7 +344,7 @@ static void view_apply_output_box(struct gride_view *view, struct wlr_output *ou
 static void view_restore_floating(struct gride_view *view) {
 	if (view->saved_snapped) {
 		view->saved_snapped = false;
-		grid_snap_view(view, view_output(view), &view->saved_range, false);
+		grid_snap_view(view, view_get_output(view), &view->saved_range, false);
 	} else if (view->has_saved) {
 		view_configure_frame(view, &view->saved);
 	} else {
@@ -344,7 +361,7 @@ void view_set_maximized(struct gride_view *view, bool maximized) {
 		view->impl->set_maximized(view, maximized);
 		return;
 	}
-	struct wlr_output *output = view_output(view);
+	struct wlr_output *output = view_get_output(view);
 	if (maximized) {
 		view_save_floating(view);
 		view->snapped = false;
@@ -354,6 +371,7 @@ void view_set_maximized(struct gride_view *view, bool maximized) {
 	if (view->deco) {
 		deco_update(view->deco); /* the maximise glyph changes */
 	}
+	ipc_event_window(view->server, view, maximized ? "maximize" : "unmaximize");
 	if (view->fullscreen) {
 		return; /* fullscreen wins; applied again when it ends */
 	}
@@ -369,7 +387,7 @@ void view_set_fullscreen(struct gride_view *view, bool fullscreen, struct wlr_ou
 		view->impl->set_fullscreen(view, fullscreen);
 		return;
 	}
-	struct wlr_output *current = output ? output : view_output(view);
+	struct wlr_output *current = output ? output : view_get_output(view);
 	if (fullscreen) {
 		view_save_floating(view);
 		view->snapped = false;
@@ -411,6 +429,7 @@ void view_set_minimized(struct gride_view *view, bool minimized) {
 		view_focus(view);
 	}
 	cursor_rebase(server, 0);
+	ipc_event_window(server, view, minimized ? "minimize" : "restore");
 }
 
 void view_restore_last_minimized(struct gride_server *server) {
@@ -436,13 +455,16 @@ void view_map(struct gride_view *view, struct wlr_surface *surface) {
 	struct wlr_output *output = output_at_cursor(server);
 	if (view->fullscreen || view->maximized) {
 		view_apply_output_box(view, output);
-	} else if (!(server->opts->grid_mode == GRIDE_GRID_AUTO_TILE &&
+	} else if (!(server->grid_mode == GRIDE_GRID_AUTO_TILE &&
 			view_is_snappable(view) && grid_auto_place(view, output))) {
 		view_place_floating(view);
 	}
 
+	/* New windows open on the workspace you are looking at. */
+	view->workspace = server->workspace;
 	wl_list_insert(&server->views, &view->link);
 	wlr_scene_node_set_enabled(&view->scene_tree->node, true);
+	ipc_event_window(server, view, "new");
 	view_focus(view);
 	cursor_rebase(server, 0);
 
@@ -463,8 +485,13 @@ void view_unmap(struct gride_view *view) {
 		server->animating--;
 	}
 	wlr_log(WLR_DEBUG, "Unmapped \"%s\"", view_title(view));
+	flyout_view_gone(server, view);
+	ipc_event_window(server, view, "close");
 	view->mapped = false;
 	view->minimized = false;
+	if (server->workspace_focus[view->workspace] == view) {
+		server->workspace_focus[view->workspace] = NULL;
+	}
 	wlr_scene_node_set_enabled(&view->scene_tree->node, false);
 	wl_list_remove(&view->link);
 	wl_list_init(&view->link);
@@ -531,7 +558,7 @@ static struct gride_view *view_from_node(struct wlr_scene_node *node) {
 /* Edges of the resize band at (lx, ly), or 0 when outside it. */
 static uint32_t resize_edges_at(struct gride_view *view, double lx, double ly) {
 	if (!view->ssd || !view->mapped || view->minimized || view->maximized ||
-			view->fullscreen) {
+			view->fullscreen || !view_on_current_workspace(view)) {
 		return 0;
 	}
 	struct wlr_box frame;
@@ -629,7 +656,7 @@ void views_arrange(struct gride_server *server) {
 	struct gride_view *view;
 	wl_list_for_each(view, &server->views, link) {
 		if (view->fullscreen || view->maximized) {
-			view_apply_output_box(view, view_output(view));
+			view_apply_output_box(view, view_get_output(view));
 		} else if (view->snapped) {
 			struct wlr_output *output = view->snap_output;
 			if (!output) {
@@ -640,6 +667,33 @@ void views_arrange(struct gride_server *server) {
 			struct gride_range range = view->range;
 			grid_snap_view(view, output, &range, false);
 		}
+	}
+}
+
+struct gride_view *view_by_id(struct gride_server *server, uint32_t id) {
+	struct gride_view *view;
+	wl_list_for_each(view, &server->views, link) {
+		if (view->id == id) {
+			return view;
+		}
+	}
+	return NULL;
+}
+
+/* The Maximise button in layout coordinates; for a window that draws its
+ * own title bar, the middle of its top edge. */
+void view_maximize_button_box(struct gride_view *view, struct wlr_box *box) {
+	struct wlr_box frame;
+	view_get_frame(view, &frame);
+	if (view->ssd && !view->fullscreen) {
+		*box = (struct wlr_box){
+			.x = frame.x + frame.width - 2 * GRIDE_TITLEBAR_BUTTON_WIDTH,
+			.y = frame.y,
+			.width = GRIDE_TITLEBAR_BUTTON_WIDTH,
+			.height = GRIDE_TITLEBAR_HEIGHT,
+		};
+	} else {
+		*box = (struct wlr_box){ frame.x + frame.width / 2, frame.y, 0, 0 };
 	}
 }
 
