@@ -10,7 +10,7 @@
 
 #include "server.h"
 
-#define GRIDE_VERSION "0.1.0"
+#define GRIDE_VERSION "0.2.0"
 
 static void usage(FILE *out, const char *argv0) {
 	fprintf(out,
@@ -21,6 +21,11 @@ static void usage(FILE *out, const char *argv0) {
 		"  -m <mod>     Main modifier: super (default) or alt. Use alt when nested\n"
 		"               in a desktop that keeps Super for itself\n"
 		"  -T <theme>   light (default) or dark\n"
+		"  -G <CxR>     Grid size, columns x rows (default 4x3, up to 8x6)\n"
+		"  -M <mode>    Grid mode: free (snap where you drop, default) or auto\n"
+		"               (new windows fill empty cells)\n"
+		"  -A           No animations\n"
+		"  -X           No XWayland (X11 apps will not start)\n"
 		"  -d           Debug logging\n"
 		"  -v           Print the version and exit\n"
 		"  -h           Show this help\n"
@@ -32,11 +37,16 @@ static void usage(FILE *out, const char *argv0) {
 int main(int argc, char *argv[]) {
 	struct gride_options opts = {
 		.mod_mask = WLR_MODIFIER_LOGO,
+		.animations = true,
+		.xwayland = true,
+		.grid_columns = 4,
+		.grid_rows = 3,
+		.grid_mode = GRIDE_GRID_FREE_SNAP,
 	};
 	bool debug = false;
 
 	int c;
-	while ((c = getopt(argc, argv, "s:t:m:T:dvh")) != -1) {
+	while ((c = getopt(argc, argv, "s:t:m:T:G:M:AXdvh")) != -1) {
 		switch (c) {
 		case 's':
 			opts.startup_cmd = optarg;
@@ -63,6 +73,34 @@ int main(int argc, char *argv[]) {
 				fprintf(stderr, "Unknown theme '%s' (use light or dark)\n", optarg);
 				return EXIT_FAILURE;
 			}
+			break;
+		case 'G': {
+			int c = 0, r = 0;
+			char extra;
+			if (sscanf(optarg, "%dx%d%c", &c, &r, &extra) != 2 || c < 1 || c > 8 ||
+					r < 1 || r > 6) {
+				fprintf(stderr, "Grid must be CxR with 1-8 columns and 1-6 rows, e.g. 4x3\n");
+				return EXIT_FAILURE;
+			}
+			opts.grid_columns = c;
+			opts.grid_rows = r;
+			break;
+		}
+		case 'M':
+			if (strcmp(optarg, "free") == 0) {
+				opts.grid_mode = GRIDE_GRID_FREE_SNAP;
+			} else if (strcmp(optarg, "auto") == 0) {
+				opts.grid_mode = GRIDE_GRID_AUTO_TILE;
+			} else {
+				fprintf(stderr, "Unknown grid mode '%s' (use free or auto)\n", optarg);
+				return EXIT_FAILURE;
+			}
+			break;
+		case 'A':
+			opts.animations = false;
+			break;
+		case 'X':
+			opts.xwayland = false;
 			break;
 		case 'd':
 			debug = true;

@@ -5,12 +5,15 @@
 #   sudo make install    install to $(PREFIX) (default /usr/local)
 #
 # Variables: PREFIX, BUILDDIR, MOD (super|alt), THEME (light|dark),
-# TERMINAL (command for Super+Enter), DEV_CMD (run once GriDE is up).
+# GRID (e.g. 4x3), GRID_MODE (free|auto), TERMINAL (command for Super+Enter),
+# DEV_CMD (run once GriDE is up).
 
 BUILDDIR ?= build
 PREFIX   ?= /usr/local
 MOD      ?= super
 THEME    ?= light
+GRID     ?= 4x3
+GRID_MODE ?= free
 TERMINAL ?=
 DEV_CMD  ?=
 
@@ -31,7 +34,7 @@ dev: build
 		echo "To run GriDE on a bare TTY instead: $(BUILDDIR)/wm/gride-wm"; \
 		exit 1; \
 	fi
-	$(BUILDDIR)/wm/gride-wm -d -m $(MOD) -T $(THEME) \
+	$(BUILDDIR)/wm/gride-wm -d -m $(MOD) -T $(THEME) -G $(GRID) -M $(GRID_MODE) \
 		$(if $(TERMINAL),-t '$(TERMINAL)') $(if $(DEV_CMD),-s '$(DEV_CMD)')
 
 install: build

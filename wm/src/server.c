@@ -17,11 +17,21 @@
 #include <wlr/types/wlr_single_pixel_buffer_v1.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_viewporter.h>
+#include <time.h>
+#include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_xdg_output_v1.h>
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/log.h>
 
+#include "draw.h"
+#include "icons.h"
 #include "server.h"
+
+uint32_t gride_now_msec(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
 
 static int handle_signal(int signal, void *data) {
 	struct gride_server *server = data;
@@ -33,6 +43,12 @@ static int handle_signal(int signal, void *data) {
 bool server_init(struct gride_server *server, const struct gride_options *opts) {
 	server->opts = opts;
 	server->palette = opts->dark ? &gride_palette_dark : &gride_palette_light;
+	server->shadow = opts->dark ? gride_shadow_float_dark : gride_shadow_float_light;
+	server->deco_scale = 1.0f;
+	wl_list_init(&server->minimized);
+	/* Before anything draws text: makes the bundled Rubik visible. */
+	draw_init_fonts();
+	deco_init_shared(server);
 	wl_list_init(&server->outputs);
 	wl_list_init(&server->views);
 	wl_list_init(&server->keyboards);
@@ -60,7 +76,7 @@ bool server_init(struct gride_server *server, const struct gride_options *opts) 
 		return false;
 	}
 	/* The nested backends are connected now. Children must not inherit
-	 * the host's X display: phase 2 points DISPLAY at our XWayland. */
+	 * the host's X display; xwayland_init() points DISPLAY at ours. */
 	unsetenv("DISPLAY");
 
 	/* GLES2 on most hardware, pixman (CPU) as the fallback. WLR_RENDERER
@@ -84,7 +100,7 @@ bool server_init(struct gride_server *server, const struct gride_options *opts) 
 	 * Globals clients bind to. Each object is owned by the display and
 	 * destroyed with it, so none are kept here unless we use them.
 	 */
-	wlr_compositor_create(server->wl_display, 6, server->renderer);
+	server->compositor = wlr_compositor_create(server->wl_display, 6, server->renderer);
 	wlr_subcompositor_create(server->wl_display);
 	wlr_data_device_manager_create(server->wl_display);
 	wlr_primary_selection_v1_device_manager_create(server->wl_display);
@@ -107,6 +123,7 @@ bool server_init(struct gride_server *server, const struct gride_options *opts) 
 		server->output_layout);
 	server->layers.background = wlr_scene_tree_create(&server->scene->tree);
 	server->layers.windows = wlr_scene_tree_create(&server->scene->tree);
+	server->layers.unmanaged = wlr_scene_tree_create(&server->scene->tree);
 	server->layers.overlay = wlr_scene_tree_create(&server->scene->tree);
 
 	/* Registered after the scene exists: the handler draws into it. */
@@ -114,10 +131,17 @@ bool server_init(struct gride_server *server, const struct gride_options *opts) 
 	wl_signal_add(&server->output_layout->events.change, &server->layout_change);
 
 	server->xdg_shell = wlr_xdg_shell_create(server->wl_display, 6);
-	server->new_xdg_toplevel.notify = view_handle_new_toplevel;
+	server->new_xdg_toplevel.notify = xdg_handle_new_toplevel;
 	wl_signal_add(&server->xdg_shell->events.new_toplevel, &server->new_xdg_toplevel);
-	server->new_xdg_popup.notify = view_handle_new_popup;
+	server->new_xdg_popup.notify = xdg_handle_new_popup;
 	wl_signal_add(&server->xdg_shell->events.new_popup, &server->new_xdg_popup);
+
+	/* Lets clients hand their title bar to us (foot, Qt and most toolkits
+	 * other than GTK). Clients that never ask keep drawing their own. */
+	server->xdg_decoration = wlr_xdg_decoration_manager_v1_create(server->wl_display);
+	server->new_xdg_decoration.notify = xdg_handle_new_decoration;
+	wl_signal_add(&server->xdg_decoration->events.new_toplevel_decoration,
+		&server->new_xdg_decoration);
 
 	cursor_init(server);
 
@@ -134,6 +158,9 @@ bool server_init(struct gride_server *server, const struct gride_options *opts) 
 		&server->request_set_primary_selection);
 	input_init(server);
 
+	if (opts->xwayland) {
+		xwayland_init(server); /* X11 apps simply fail to start without it */
+	}
 	return true;
 }
 
@@ -173,7 +200,9 @@ void server_finish(struct gride_server *server) {
 	if (!server->wl_display) {
 		return;
 	}
+	xwayland_finish(server);
 	wl_display_destroy_clients(server->wl_display);
+	grid_finish(server);
 
 	if (server->sigint_source) {
 		wl_event_source_remove(server->sigint_source);
@@ -191,6 +220,9 @@ void server_finish(struct gride_server *server) {
 	if (server->xdg_shell) {
 		wl_list_remove(&server->new_xdg_toplevel.link);
 		wl_list_remove(&server->new_xdg_popup.link);
+	}
+	if (server->xdg_decoration) {
+		wl_list_remove(&server->new_xdg_decoration.link);
 	}
 	if (server->cursor) {
 		cursor_finish(server);
@@ -215,4 +247,6 @@ void server_finish(struct gride_server *server) {
 	}
 	wl_display_destroy(server->wl_display);
 	server->wl_display = NULL;
+	deco_finish_shared();
+	icons_finish();
 }

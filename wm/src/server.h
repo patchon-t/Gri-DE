@@ -4,9 +4,9 @@
  * Ownership in short:
  *  - struct gride_server lives on main()'s stack for the whole run.
  *  - Every other struct here is heap-allocated when wlroots announces the
- *    object (new_output, new_toplevel, new_input...) and freed in the
- *    handler for that object's `destroy` signal. A struct never outlives
- *    the wlroots object it wraps.
+ *    object (new_output, new_toplevel, new_surface, new_input...) and freed
+ *    in the handler for that object's `destroy` signal. A struct never
+ *    outlives the wlroots object it wraps.
  *  - Every wl_listener is removed (wl_list_remove) before its struct is
  *    freed. A freed listener left in a signal list is a use-after-free the
  *    next time the signal fires.
@@ -17,7 +17,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <wayland-server-core.h>
-#include <wlr/types/wlr_output_layout.h>
 #include <wlr/util/box.h>
 #include <xkbcommon/xkbcommon.h>
 
@@ -29,23 +28,54 @@ struct wlr_cursor;
 struct wlr_input_device;
 struct wlr_keyboard;
 struct wlr_output;
+struct wlr_output_layout;
 struct wlr_renderer;
 struct wlr_scene;
 struct wlr_scene_buffer;
+struct wlr_scene_node;
+struct wlr_compositor;
 struct wlr_scene_output_layout;
+struct wlr_scene_rect;
 struct wlr_scene_tree;
 struct wlr_seat;
 struct wlr_session;
 struct wlr_surface;
 struct wlr_xcursor_manager;
+struct wlr_xdg_decoration_manager_v1;
 struct wlr_xdg_popup;
 struct wlr_xdg_shell;
 struct wlr_xdg_toplevel;
+struct wlr_xdg_toplevel_decoration_v1;
+struct wlr_xwayland;
+struct wlr_xwayland_surface;
+struct gride_deco;
+struct gride_grid_overlay;
+
+/* ---- sizes from the design spec that tokens.json does not carry --------- */
+
+#define GRIDE_TITLEBAR_HEIGHT 36
+#define GRIDE_TITLEBAR_BUTTON_WIDTH 46
+#define GRIDE_TITLEBAR_GLYPH 14
+#define GRIDE_TITLEBAR_GLYPH_STROKE 1.8
+#define GRIDE_TITLEBAR_ICON 18
+#define GRIDE_SNAP_DURATION_MS 180
+/* Invisible band outside a decorated window where dragging resizes it. */
+#define GRIDE_RESIZE_BORDER 6
 
 enum gride_cursor_mode {
 	GRIDE_CURSOR_PASSTHROUGH,
 	GRIDE_CURSOR_MOVE,
 	GRIDE_CURSOR_RESIZE,
+	/* A title bar button is held down; it fires on release over it. */
+	GRIDE_CURSOR_BUTTON,
+	/* Pressed on a title bar or with Super: becomes a move or resize once
+	 * the pointer travels a few pixels, so a plain click stays a click. */
+	GRIDE_CURSOR_PENDING,
+};
+
+enum gride_grid_mode {
+	GRIDE_GRID_FREE_SNAP, /* drop a window and it snaps to the nearest cells */
+	GRIDE_GRID_AUTO_TILE, /* new windows fill empty cells */
 };
 
 /* Options from the command line. Phase 6 adds config.toml on top. */
@@ -54,6 +84,40 @@ struct gride_options {
 	const char *terminal;    /* -t: command for Super+Enter */
 	uint32_t mod_mask;       /* WLR_MODIFIER_LOGO, or ALT for nested dev */
 	bool dark;               /* palette choice */
+	bool animations;         /* -A turns them off */
+	bool xwayland;           /* -X turns XWayland off */
+	int grid_columns, grid_rows;
+	enum gride_grid_mode grid_mode;
+};
+
+/* An inclusive cell range: columns are letters, rows numbers. A1 = (0,0). */
+struct gride_range {
+	int c0, r0, c1, r1;
+};
+
+/* Where a pointer position lands. */
+enum gride_hit_type {
+	GRIDE_HIT_NONE,    /* the desktop */
+	GRIDE_HIT_SURFACE, /* a client surface; view may be NULL (X11 menus) */
+	GRIDE_HIT_DECO,    /* our title bar */
+	GRIDE_HIT_RESIZE,  /* the invisible resize band */
+};
+
+enum gride_deco_part {
+	GRIDE_DECO_NONE,
+	GRIDE_DECO_TITLE,
+	GRIDE_DECO_MINIMIZE,
+	GRIDE_DECO_MAXIMIZE,
+	GRIDE_DECO_CLOSE,
+};
+
+struct gride_hit {
+	enum gride_hit_type type;
+	struct gride_view *view;
+	struct wlr_surface *surface;
+	double sx, sy;
+	enum gride_deco_part part;
+	uint32_t edges;
 };
 
 struct gride_server {
@@ -63,16 +127,22 @@ struct gride_server {
 	struct wlr_session *session; /* NULL when nested */
 	struct wlr_renderer *renderer;
 	struct wlr_allocator *allocator;
+	struct wlr_compositor *compositor;
 
 	const struct gride_options *opts;
 	const struct gride_palette *palette;
+	const struct gride_shadow_layer *shadow;
+	/* Largest output scale: decorations are drawn at it so they stay sharp
+	 * on every output (wlroots scales them down elsewhere). */
+	float deco_scale;
 
 	/*
 	 * Scene graph. wlroots renders the tree back to front, so the order
 	 * these trees are created in is the stacking order:
 	 *   background  desktop fill and dot grid, one node per output
-	 *   windows     one gride_view tree per toplevel; popups nest inside
-	 *   overlay     reserved: grid overlay (phase 2), flyouts (phase 3)
+	 *   windows     one gride_view tree per window; popups nest inside
+	 *   unmanaged   X11 menus and tooltips (override-redirect windows)
+	 *   overlay     the grid drag overlay; flyouts in phase 3
 	 * The trees are owned by the scene and destroyed with it.
 	 */
 	struct wlr_scene *scene;
@@ -80,6 +150,7 @@ struct gride_server {
 	struct {
 		struct wlr_scene_tree *background;
 		struct wlr_scene_tree *windows;
+		struct wlr_scene_tree *unmanaged;
 		struct wlr_scene_tree *overlay;
 	} layers;
 
@@ -91,12 +162,23 @@ struct gride_server {
 	struct wlr_xdg_shell *xdg_shell;
 	struct wl_listener new_xdg_toplevel;
 	struct wl_listener new_xdg_popup;
-	/* Mapped views, front-to-back: the first entry is on top. */
+	struct wlr_xdg_decoration_manager_v1 *xdg_decoration;
+	struct wl_listener new_xdg_decoration;
+
+	struct wlr_xwayland *xwayland; /* NULL when disabled */
+	struct wl_listener xwayland_ready;
+	struct wl_listener new_xwayland_surface;
+
+	/* Mapped views, front-to-back: the first entry is on top. Minimised
+	 * views stay in the list but are hidden and skipped. */
 	struct wl_list views; /* gride_view.link */
 	struct gride_view *focused_view;
+	/* Most recently minimised first, for restoring. */
+	struct wl_list minimized; /* gride_view.minimized_link */
 
 	struct wlr_cursor *cursor;
 	struct wlr_xcursor_manager *cursor_mgr;
+	const char *cursor_image; /* the xcursor name we last set, or NULL */
 	struct wl_listener cursor_motion;
 	struct wl_listener cursor_motion_absolute;
 	struct wl_listener cursor_button;
@@ -114,15 +196,29 @@ struct gride_server {
 	struct wl_listener new_virtual_keyboard;
 	struct wl_listener new_virtual_pointer;
 
-	/* Interactive move/resize state. */
+	/* Interactive move/resize/button state. */
 	enum gride_cursor_mode cursor_mode;
 	struct gride_view *grabbed_view;
 	double grab_x, grab_y;
-	struct wlr_box grab_geobox;
+	struct wlr_box grab_geobox; /* frame box at grab start */
 	uint32_t resize_edges;
-	/* True when the grab came from a Super+drag rather than the client:
-	 * the button release then belongs to us and is not sent on. */
+	enum gride_deco_part pressed_part;
+	enum gride_cursor_mode pending_mode; /* what PENDING turns into */
+	uint32_t pending_edges;
+	double press_x, press_y;
+	/* The decorated view whose buttons the pointer is over, if any. */
+	struct gride_view *hover_view;
+	/* True when the grab came from us (title bar, Super+drag) rather than
+	 * the client: the button release then belongs to us. */
 	bool grab_is_ours;
+	/* Title bar double-click detection. */
+	uint32_t last_title_click_msec;
+	struct gride_view *last_title_click_view;
+
+	/* The grid. */
+	struct gride_grid_overlay *grid_overlay; /* non-NULL while dragging */
+	struct wl_event_source *anim_timer;
+	int animating; /* views with a running snap animation */
 
 	struct wl_event_source *sigint_source;
 	struct wl_event_source *sigterm_source;
@@ -139,46 +235,80 @@ struct gride_output {
 	struct wl_listener destroy;
 };
 
+enum gride_view_type {
+	GRIDE_VIEW_XDG,
+	GRIDE_VIEW_XWAYLAND,
+};
+
+struct gride_view;
+
+/* What a view type (xdg toplevel, X11 window) must do for the generic code. */
+struct gride_view_impl {
+	/* Ask the client for a content size; (x, y) is where the content will
+	 * be in layout space (X11 needs it; xdg ignores it). */
+	void (*configure)(struct gride_view *view, int x, int y, int width, int height);
+	void (*set_activated)(struct gride_view *view, bool activated);
+	void (*set_maximized)(struct gride_view *view, bool maximized);
+	void (*set_fullscreen)(struct gride_view *view, bool fullscreen);
+	void (*set_minimized)(struct gride_view *view, bool minimized);
+	void (*set_resizing)(struct gride_view *view, bool resizing);
+	void (*close)(struct gride_view *view);
+	const char *(*get_title)(struct gride_view *view);
+	const char *(*get_app_id)(struct gride_view *view);
+	/* 0 means no limit. */
+	void (*get_constraints)(struct gride_view *view, int *min_w, int *min_h,
+		int *max_w, int *max_h);
+	/* Dialogs and other windows with a parent: never snapped or tiled. */
+	bool (*is_transient)(struct gride_view *view);
+};
+
 /*
- * A toplevel window.
+ * A window, from either xdg-shell or XWayland.
  *
- * Coordinates: (x, y) is where the window's *visible content* (its xdg
- * window geometry) sits in layout space, not the surface origin. Clients
- * that draw their own shadows put them outside the geometry, so this is
- * the box the grid engine snaps in phase 2. scene_tree sits at (x, y);
- * wlroots offsets the surfaces inside surface_tree by (-geometry.x,
- * -geometry.y), so the content's top-left lands on (x, y).
+ * Coordinates: (x, y) is the top-left of the *frame* in layout space: our
+ * title bar when the window is decorated, else the client's visible content
+ * (its xdg window geometry, which excludes client-drawn shadows). The frame
+ * is the box the grid snaps. content_tree sits below the title bar.
  */
 struct gride_view {
 	struct wl_list link;
+	struct wl_list minimized_link;
 	struct gride_server *server;
-	struct wlr_xdg_toplevel *xdg_toplevel;
+	enum gride_view_type type;
+	const struct gride_view_impl *impl;
+	struct wlr_surface *surface;         /* set while mapped */
+
 	struct wlr_scene_tree *scene_tree;   /* ours; node.data = this view */
-	struct wlr_scene_tree *surface_tree; /* the xdg surface subtree */
+	struct wlr_scene_tree *content_tree; /* holds the client's surfaces */
+	struct gride_deco *deco;             /* title bar etc. while ssd */
+	bool ssd;                            /* we draw the decorations */
+
 	int x, y;
+	int content_width, content_height;   /* last committed content size */
+
 	bool mapped;
 	bool maximized;
 	bool fullscreen;
+	bool minimized;
+
 	/* Floating geometry to go back to after maximise/fullscreen. */
 	struct wlr_box saved;
 	bool has_saved;
+	bool saved_snapped;
+	struct gride_range saved_range;
 	bool center_pending; /* centre on the next commit (client picks size) */
 
-	struct wl_listener map;
-	struct wl_listener unmap;
-	struct wl_listener commit;
-	struct wl_listener destroy;
-	struct wl_listener request_move;
-	struct wl_listener request_resize;
-	struct wl_listener request_maximize;
-	struct wl_listener request_fullscreen;
-};
+	/* Grid placement. */
+	bool snapped;
+	struct gride_range range;
+	struct wlr_output *snap_output;
 
-struct gride_popup {
-	struct wlr_xdg_popup *xdg_popup;
-	struct wl_listener commit;
-	struct wl_listener reposition;
-	struct wl_listener destroy;
+	/* Snap animation of the frame position. */
+	struct {
+		bool active;
+		int from_x, from_y, to_x, to_y;
+		uint32_t start_msec;
+	} anim;
 };
 
 struct gride_keyboard {
@@ -196,6 +326,7 @@ bool server_init(struct gride_server *server, const struct gride_options *opts);
 bool server_start(struct gride_server *server);
 void server_run(struct gride_server *server);
 void server_finish(struct gride_server *server);
+uint32_t gride_now_msec(void);
 
 /* output.c */
 void output_handle_new(struct wl_listener *listener, void *data);
@@ -210,24 +341,81 @@ void background_update(struct gride_background *bg, const struct gride_palette *
 	struct wlr_output *output, const struct wlr_box *layout_box);
 void background_destroy(struct gride_background *bg);
 
-/* view.c */
-void view_handle_new_toplevel(struct wl_listener *listener, void *data);
-void view_handle_new_popup(struct wl_listener *listener, void *data);
-void view_focus(struct gride_view *view);
-struct gride_view *view_at(struct gride_server *server, double lx, double ly,
-	struct wlr_surface **surface, double *sx, double *sy);
-void view_get_geometry(struct gride_view *view, struct wlr_box *box);
+/* view.c: the generic window logic */
+void view_init(struct gride_view *view, struct gride_server *server,
+	enum gride_view_type type, const struct gride_view_impl *impl);
+void view_destroy(struct gride_view *view);
+void view_map(struct gride_view *view, struct wlr_surface *surface);
+void view_unmap(struct gride_view *view);
+void view_content_committed(struct gride_view *view, int width, int height);
+void view_set_ssd(struct gride_view *view, bool ssd);
+void view_title_changed(struct gride_view *view);
+int view_titlebar_height(struct gride_view *view);
+void view_get_frame(struct gride_view *view, struct wlr_box *box);
 void view_move_to(struct gride_view *view, int x, int y);
-void view_set_size(struct gride_view *view, int width, int height);
+void view_configure_frame(struct gride_view *view, const struct wlr_box *frame);
+void view_set_content_size(struct gride_view *view, int width, int height);
+void view_focus(struct gride_view *view);
+void view_raise(struct gride_view *view);
 void view_set_maximized(struct gride_view *view, bool maximized);
 void view_set_fullscreen(struct gride_view *view, bool fullscreen, struct wlr_output *output);
+void view_set_minimized(struct gride_view *view, bool minimized);
+void view_restore_last_minimized(struct gride_server *server);
 void view_close(struct gride_view *view);
+bool view_is_snappable(struct gride_view *view);
+bool view_is_terminal(struct gride_view *view);
+const char *view_title(struct gride_view *view);
+const char *view_app_id(struct gride_view *view);
+void view_hit_test(struct gride_server *server, double lx, double ly, struct gride_hit *hit);
+struct gride_view *view_from_surface(struct gride_server *server, struct wlr_surface *surface);
 void views_arrange(struct gride_server *server);
+void views_redraw_decorations(struct gride_server *server);
+
+/* xdg.c */
+void xdg_handle_new_toplevel(struct wl_listener *listener, void *data);
+void xdg_handle_new_popup(struct wl_listener *listener, void *data);
+void xdg_handle_new_decoration(struct wl_listener *listener, void *data);
+
+/* xwayland.c */
+bool xwayland_init(struct gride_server *server);
+void xwayland_finish(struct gride_server *server);
+
+/* deco.c: server-side decorations */
+struct gride_deco *deco_create(struct gride_view *view);
+void deco_destroy(struct gride_deco *deco);
+void deco_update(struct gride_deco *deco);          /* size, focus, title changed */
+void deco_set_hover(struct gride_deco *deco, enum gride_deco_part part);
+void deco_set_pressed(struct gride_deco *deco, enum gride_deco_part part);
+enum gride_deco_part deco_part_at(struct gride_deco *deco, double fx, double fy);
+bool deco_owns_node(struct gride_deco *deco, struct wlr_scene_node *node);
+void deco_init_shared(struct gride_server *server);
+void deco_finish_shared(void);
+
+/* grid.c */
+void grid_area(struct gride_server *server, struct wlr_output *output, struct wlr_box *area);
+void grid_range_box(struct gride_server *server, struct wlr_output *output,
+	const struct gride_range *range, struct wlr_box *box);
+void grid_range_label(struct gride_server *server, const struct gride_range *range,
+	char *ids, size_t ids_len, char *name, size_t name_len);
+void grid_nearest_range(struct gride_server *server, struct wlr_output *output,
+	const struct wlr_box *frame, struct gride_range *range);
+void grid_snap_view(struct gride_view *view, struct wlr_output *output,
+	const struct gride_range *range, bool animate);
+void grid_unsnap_view(struct gride_view *view);
+bool grid_auto_place(struct gride_view *view, struct wlr_output *output);
+void grid_move_view(struct gride_view *view, int dc, int dr);
+void grid_resize_view(struct gride_view *view, int dc, int dr);
+void grid_drag_begin(struct gride_server *server, struct gride_view *view);
+void grid_drag_update(struct gride_server *server);
+void grid_drag_end(struct gride_server *server, bool snap);
+void grid_output_removed(struct gride_server *server, struct wlr_output *output);
+void grid_finish(struct gride_server *server);
 
 /* input.c */
 void input_init(struct gride_server *server);
 void input_finish(struct gride_server *server);
 void input_handle_new(struct wl_listener *listener, void *data);
+uint32_t input_current_modifiers(struct gride_server *server);
 void seat_handle_request_cursor(struct wl_listener *listener, void *data);
 void seat_handle_request_set_selection(struct wl_listener *listener, void *data);
 void seat_handle_request_set_primary_selection(struct wl_listener *listener, void *data);
@@ -235,6 +423,7 @@ void seat_handle_request_set_primary_selection(struct wl_listener *listener, voi
 /* cursor.c */
 void cursor_init(struct gride_server *server);
 void cursor_finish(struct gride_server *server);
+void cursor_set_image(struct gride_server *server, const char *name);
 void cursor_begin_interactive(struct gride_view *view, enum gride_cursor_mode mode,
 	uint32_t edges, bool ours);
 void cursor_end_interactive(struct gride_server *server);
