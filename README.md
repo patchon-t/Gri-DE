@@ -4,9 +4,10 @@ GriDE (Grid Desktop Environment) is a Wayland desktop with a Windows-style layou
 (bottom taskbar, Start menu, snap layouts, task view) built around one idea: the grid.
 Windows snap to cells of a screen grid, and workspaces form a 3×3 grid.
 
-**Status: Phase 2 of 7.** The compositor `gride-wm` runs nested or on a TTY. It draws the
-GriDE title bar, runs X11 apps through XWayland and snaps windows to the grid. The
-taskbar, Start menu, task view and settings arrive in later phases.
+**Status: Phase 3 of 7.** The compositor `gride-wm` runs nested or on a TTY. It draws the
+GriDE title bar, runs X11 apps through XWayland, snaps windows to the grid, has the snap
+layouts flyout and 3×3 workspaces, and can be driven with `gride-msg`. The taskbar, Start
+menu, task view and settings arrive in later phases.
 
 ## Supported systems
 
@@ -40,7 +41,7 @@ Other `make dev` variables: `GRID=4x3`, `GRID_MODE=auto`, `THEME=dark`,
 To run on real hardware, switch to a free TTY (Ctrl+Alt+F3), log in, and run
 `build/wm/gride-wm`. A display-manager session entry arrives in phase 7.
 
-`sudo make install` installs `gride-wm` to `/usr/local/bin` and Rubik to
+`sudo make install` installs `gride-wm` and `gride-msg` to `/usr/local/bin` and Rubik to
 `/usr/local/share/fonts/gride`. Set `PREFIX=` to change that.
 
 ## The grid
@@ -58,6 +59,39 @@ rows are numbers, so `A1:B3` is the left half of a 4 × 3 grid.
 
 Dialogs and fixed-size windows never snap.
 
+## Snap layouts
+
+Hover over a window's Maximise button for a moment, or press Super+Z, to open the snap
+layouts flyout. Point at a zone in one of the six layouts (halves, two-thirds and
+one-third, thirds, quarters, main and two stacked, centre focus) and the desktop shows
+where the window will go; click to snap it there. Or drag across the cells under
+"Or drag across cells" to pick any range. With the keyboard: arrows choose a zone,
+Enter snaps, Escape closes.
+
+## Workspaces
+
+Nine workspaces in a 3 × 3 grid, shared by all monitors. Super+Arrow moves to the
+neighbouring workspace (the grid has edges, so there is no wrapping). Super+Shift+1…9
+sends the focused window to a workspace while you stay where you are. New windows open
+on the current workspace.
+
+## gride-msg
+
+`gride-msg` drives a running GriDE over `$XDG_RUNTIME_DIR/gride.sock`:
+
+```bash
+gride-msg windows
+gride-msg snap A1:B2
+gride-msg workspace 5
+gride-msg grid set 4x3
+gride-msg subscribe window workspace
+```
+
+Run `gride-msg -h` for every command. Add `-j` for JSON. The protocol is one JSON
+object per line, for example `{"command": "snap", "range": "A1:B2"}`; the shell (phase
+4) uses the same socket. A second GriDE (say, a nested one) uses
+`gride-$WAYLAND_DISPLAY.sock` and exports the path as `$GRIDE_SOCK` to its programs.
+
 ## Title bars
 
 GriDE draws a 36px title bar for apps that let it: foot, Qt apps, most toolkits other
@@ -71,11 +105,15 @@ than GTK, and X11 apps. GTK apps draw their own header bars; the GriDE GTK theme
 | Super+Enter | Terminal (`-t`, then `$GRIDE_TERMINAL`, then foot) |
 | Super+Q | Close the focused window |
 | Super+F | Fullscreen on or off |
+| Super+Z | Snap layouts for the focused window |
+| Super+Arrow | Move to the neighbouring workspace |
+| Super+Shift+1…9 | Send the focused window to workspace 1-9 |
 | Super+Shift+Arrow | Move the window one cell |
 | Super+Ctrl+Arrow | Grow or shrink the window by one cell (right and bottom edges) |
 | Super+left drag | Move a window |
 | Super+right drag | Resize from the nearest corner |
 | Title bar drag | Move; double-click to maximise or restore |
+| Hover Maximise | Snap layouts |
 | Window edge drag | Resize |
 | Super+Shift+M | Restore the last minimised window (until the taskbar arrives in phase 4) |
 | Super+Shift+Escape | Quit GriDE (development; phase 7 adds a confirmation) |
@@ -121,12 +159,16 @@ wm/                  gride-wm, the compositor (C, wlroots 0.18)
   src/xwayland.c     X11 windows and menus
   src/deco.c         title bars, window edges and the shadow
   src/grid.c         the grid engine, snapping and the drag overlay
+  src/flyout.c       the snap layouts flyout
+  src/workspace.c    the 3x3 workspaces
+  src/ipc.c          the gride.sock JSON socket
   src/draw.c         cairo buffers and text
   src/icons.c        app names and icons from .desktop files
   src/input.c        keyboards, bindings, virtual input
   src/cursor.c       pointer focus, title bar buttons, move and resize
   src/spawn.c        launching programs
   src/log.c          the log file
+msg/gride-msg.c      the command-line client for gride.sock
 ```
 
 ## Design

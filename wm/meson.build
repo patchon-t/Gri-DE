@@ -9,6 +9,7 @@ fontconfig = dependency('fontconfig')
 librsvg = dependency('librsvg-2.0', version: '>=2.52')
 xcb = dependency('xcb')
 xcb_icccm = dependency('xcb-icccm')
+jsonc = dependency('json-c')
 libdrm = dependency('libdrm').partial_dependency(compile_args: true, includes: true)
 math = cc.find_library('m', required: false)
 
@@ -32,6 +33,9 @@ executable(
 		'src/xwayland.c',
 		'src/deco.c',
 		'src/grid.c',
+		'src/workspace.c',
+		'src/flyout.c',
+		'src/ipc.c',
 		'src/draw.c',
 		'src/icons.c',
 		'src/input.c',
@@ -48,7 +52,7 @@ executable(
 	include_directories: include_directories('src'),
 	dependencies: [
 		wlroots, wayland_server, xkbcommon, libinput, pixman, cairo, pangocairo,
-		fontconfig, librsvg, xcb, xcb_icccm, libdrm, math,
+		fontconfig, librsvg, xcb, xcb_icccm, jsonc, libdrm, math,
 	],
 	install: true,
 )

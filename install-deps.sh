@@ -5,7 +5,7 @@
 # Usage: ./install-deps.sh
 set -euo pipefail
 
-# Phases 1-2: the compositor. Later phases add to this list.
+# Phases 1-3: the compositor and gride-msg. Later phases add to this list.
 packages=(
 	build-essential      # C compiler and make
 	meson                # build system (>= 1.3)
@@ -26,6 +26,7 @@ packages=(
 	libxcb1-dev          # X11 window hints
 	libxcb-icccm4-dev
 	xwayland             # X11 apps
+	libjson-c-dev        # the IPC socket and gride-msg
 	foot                 # default terminal for Super+Enter
 	fonts-jetbrains-mono # the GriDE mono font
 )

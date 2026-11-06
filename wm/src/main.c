@@ -10,7 +10,6 @@
 
 #include "server.h"
 
-#define GRIDE_VERSION "0.2.0"
 
 static void usage(FILE *out, const char *argv0) {
 	fprintf(out,

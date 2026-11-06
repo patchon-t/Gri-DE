@@ -43,8 +43,19 @@ static void set_hover(struct gride_server *server, struct gride_view *view,
 
 /* Send pointer enter/motion to whatever is under the cursor. */
 static void process_passthrough(struct gride_server *server, uint32_t time) {
+	double lx = server->cursor->x, ly = server->cursor->y;
+	if (flyout_contains(server, lx, ly)) {
+		/* The snap layouts flyout sits above every window. */
+		set_hover(server, NULL, GRIDE_DECO_NONE);
+		cursor_set_image(server, "default");
+		wlr_seat_pointer_notify_clear_focus(server->seat);
+		flyout_pointer_motion(server, lx, ly);
+		return;
+	}
 	struct gride_hit hit;
-	view_hit_test(server, server->cursor->x, server->cursor->y, &hit);
+	view_hit_test(server, lx, ly, &hit);
+	flyout_hover_maximize(server, hit.type == GRIDE_HIT_DECO &&
+		hit.part == GRIDE_DECO_MAXIMIZE ? hit.view : NULL);
 	switch (hit.type) {
 	case GRIDE_HIT_SURFACE:
 		set_hover(server, NULL, GRIDE_DECO_NONE);
@@ -175,6 +186,9 @@ static void process_motion(struct gride_server *server, uint32_t time) {
 		}
 		break;
 	}
+	case GRIDE_CURSOR_FLYOUT:
+		flyout_pointer_motion(server, server->cursor->x, server->cursor->y);
+		break;
 	case GRIDE_CURSOR_PASSTHROUGH:
 		process_passthrough(server, time);
 		break;
@@ -335,12 +349,19 @@ static void handle_release(struct gride_server *server, struct wlr_pointer_butto
 		}
 		break;
 	}
+	case GRIDE_CURSOR_FLYOUT:
+		flyout_pointer_button(server, server->cursor->x, server->cursor->y, false);
+		cursor_rebase(server, event->time_msec);
+		return;
 	case GRIDE_CURSOR_PENDING:
 		/* Released before dragging: it was a click, already handled. */
 		cursor_end_interactive(server);
 		cursor_rebase(server, event->time_msec);
 		return;
 	case GRIDE_CURSOR_PASSTHROUGH:
+		if (flyout_pointer_button(server, server->cursor->x, server->cursor->y, false)) {
+			return; /* the release of a click on the flyout */
+		}
 		break;
 	}
 	wlr_seat_pointer_notify_button(server->seat, event->time_msec, event->button, event->state);
@@ -356,6 +377,16 @@ static void handle_button(struct wl_listener *listener, void *data) {
 	}
 	if (server->cursor_mode != GRIDE_CURSOR_PASSTHROUGH) {
 		return; /* a second button during a grab */
+	}
+	if (server->flyout) {
+		if (event->button == BTN_LEFT &&
+				flyout_pointer_button(server, server->cursor->x, server->cursor->y, true)) {
+			return;
+		}
+		if (flyout_contains(server, server->cursor->x, server->cursor->y)) {
+			return; /* other buttons on the flyout do nothing */
+		}
+		flyout_close(server); /* a click elsewhere closes it, then counts */
 	}
 
 	struct gride_hit hit;

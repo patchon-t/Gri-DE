@@ -76,31 +76,31 @@ static void gauss_boxes(double sigma, int sizes[3]) {
 	}
 }
 
-static void box_blur_pass(float *src, float *dst, int size, int r, bool horizontal) {
+static void box_blur_pass(const float *src, float *dst, int w, int h, int r, bool horizontal) {
 	float inv = 1.0f / (2 * r + 1);
-	for (int line = 0; line < size; line++) {
+	int lines = horizontal ? h : w, len = horizontal ? w : h;
+	for (int line = 0; line < lines; line++) {
+#define AT(i) (horizontal ? src[line * w + (i)] : src[(i) * w + line])
 		float acc = 0;
 		/* Values outside the image are 0 (the shadow fades out before it). */
-		for (int k = -r; k <= r; k++) {
-			if (k >= 0 && k < size) {
-				acc += horizontal ? src[line * size + k] : src[k * size + line];
-			}
+		for (int k = 0; k <= r && k < len; k++) {
+			acc += AT(k);
 		}
-		for (int i = 0; i < size; i++) {
-			int idx = horizontal ? line * size + i : i * size + line;
-			dst[idx] = acc * inv;
+		for (int i = 0; i < len; i++) {
+			dst[horizontal ? line * w + i : i * w + line] = acc * inv;
 			int add = i + r + 1, sub = i - r;
-			if (add < size) {
-				acc += horizontal ? src[line * size + add] : src[add * size + line];
+			if (add < len) {
+				acc += AT(add);
 			}
 			if (sub >= 0) {
-				acc -= horizontal ? src[line * size + sub] : src[sub * size + line];
+				acc -= AT(sub);
 			}
 		}
+#undef AT
 	}
 }
 
-static void gaussian_blur(float *data, float *tmp, int size, double sigma) {
+static void gaussian_blur(float *data, float *tmp, int w, int h, double sigma) {
 	if (sigma <= 0) {
 		return;
 	}
@@ -108,71 +108,69 @@ static void gaussian_blur(float *data, float *tmp, int size, double sigma) {
 	gauss_boxes(sigma, boxes);
 	for (int i = 0; i < 3; i++) {
 		int r = (boxes[i] - 1) / 2;
-		box_blur_pass(data, tmp, size, r, true);
-		box_blur_pass(tmp, data, size, r, false);
+		box_blur_pass(data, tmp, w, h, r, true);
+		box_blur_pass(tmp, data, w, h, r, false);
 	}
 }
 
 /* Coverage (0..1) of a rounded rectangle, rasterised by cairo. */
-static float *rounded_rect_mask(int size, double x, double y, double w, double h, double r) {
-	cairo_surface_t *a8 = cairo_image_surface_create(CAIRO_FORMAT_A8, size, size);
+static float *rounded_rect_mask(int w, int h, double x, double y, double rw, double rh,
+		double r) {
+	cairo_surface_t *a8 = cairo_image_surface_create(CAIRO_FORMAT_A8, w, h);
 	cairo_t *cr = cairo_create(a8);
-	draw_rounded_rect(cr, x, y, w, h, r);
+	draw_rounded_rect(cr, x, y, rw, rh, r);
 	cairo_set_source_rgba(cr, 0, 0, 0, 1);
 	cairo_fill(cr);
 	cairo_destroy(cr);
 	cairo_surface_flush(a8);
-	float *mask = malloc(sizeof(float) * (size_t)size * (size_t)size);
+	float *mask = malloc(sizeof(float) * (size_t)w * (size_t)h);
 	unsigned char *px = cairo_image_surface_get_data(a8);
 	int stride = cairo_image_surface_get_stride(a8);
-	for (int j = 0; mask && j < size; j++) {
-		for (int i = 0; i < size; i++) {
-			mask[j * size + i] = px[j * stride + i] / 255.0f;
+	for (int j = 0; mask && j < h; j++) {
+		for (int i = 0; i < w; i++) {
+			mask[j * w + i] = px[j * stride + i] / 255.0f;
 		}
 	}
 	cairo_surface_destroy(a8);
 	return mask;
 }
 
-static void shadow_build(const struct gride_shadow_layer *layers) {
-	const double radius = GRIDE_RADIUS_MD;
-	double reach = 0, inner_reach = 0;
+int shadow_reach(const struct gride_shadow_layer *layers) {
+	double reach = 0;
 	for (int i = 0; i < GRIDE_SHADOW_FLOAT_LAYERS; i++) {
 		/* CSS blur radius = 2 sigma; a gaussian is invisible past 3 sigma. */
-		double extent = 1.5 * layers[i].blur;
-		double out = extent + fmax(fabs(layers[i].x), fabs(layers[i].y));
+		double out = 1.5 * layers[i].blur + fmax(fabs(layers[i].x), fabs(layers[i].y));
 		reach = fmax(reach, out);
-		inner_reach = fmax(inner_reach, extent);
 	}
-	shadow.pad = (int)ceil(reach);
-	int inner_corner = (int)ceil(inner_reach + radius);
-	shadow.corner = shadow.pad + inner_corner;
-	int inner = 2 * inner_corner + 2; /* a 2px stretchable middle */
-	shadow.size = 2 * shadow.pad + inner;
-	int size = shadow.size;
+	return (int)ceil(reach);
+}
 
-	shadow.buf = draw_buffer_create(size, size, 1.0f);
-	float *acc_rgb[3], *acc_a;
-	size_t n = (size_t)size * (size_t)size;
-	acc_a = calloc(n, sizeof(float));
-	for (int c = 0; c < 3; c++) {
-		acc_rgb[c] = calloc(n, sizeof(float));
-	}
+struct draw_buffer *shadow_render(int w, int h, double radius,
+		const struct gride_shadow_layer *layers) {
+	int pad = shadow_reach(layers);
+	int bw = w + 2 * pad, bh = h + 2 * pad;
+	struct draw_buffer *buf = draw_buffer_create(bw, bh, 1.0f);
+	size_t n = (size_t)bw * (size_t)bh;
+	float *acc_rgb[3] = { calloc(n, sizeof(float)), calloc(n, sizeof(float)),
+		calloc(n, sizeof(float)) };
+	float *acc_a = calloc(n, sizeof(float));
 	float *tmp = malloc(n * sizeof(float));
-	if (!shadow.buf || !acc_a || !acc_rgb[0] || !acc_rgb[1] || !acc_rgb[2] || !tmp) {
-		wlr_log(WLR_ERROR, "Out of memory building the window shadow");
+	float *window = NULL;
+	if (!buf || !acc_a || !acc_rgb[0] || !acc_rgb[1] || !acc_rgb[2] || !tmp) {
+		wlr_log(WLR_ERROR, "Out of memory drawing a shadow");
+		draw_buffer_drop(buf);
+		buf = NULL;
 		goto out;
 	}
 
 	/* Composite the layers back to front: the first CSS shadow is on top. */
 	for (int l = GRIDE_SHADOW_FLOAT_LAYERS - 1; l >= 0; l--) {
 		const struct gride_shadow_layer *layer = &layers[l];
-		float *mask = rounded_rect_mask(size, shadow.pad + layer->x, shadow.pad + layer->y,
-			inner, inner, radius);
+		float *mask = rounded_rect_mask(bw, bh, pad + layer->x, pad + layer->y, w, h, radius);
 		if (!mask) {
 			continue;
 		}
-		gaussian_blur(mask, tmp, size, layer->blur / 2.0);
+		gaussian_blur(mask, tmp, bw, bh, layer->blur / 2.0);
 		for (size_t i = 0; i < n; i++) {
 			float a = layer->color[3] * mask[i];
 			for (int c = 0; c < 3; c++) {
@@ -183,14 +181,15 @@ static void shadow_build(const struct gride_shadow_layer *layers) {
 		free(mask);
 	}
 
-	/* Cut out the window itself. */
-	float *window = rounded_rect_mask(size, shadow.pad, shadow.pad, inner, inner, radius);
-	unsigned char *px = cairo_image_surface_get_data(shadow.buf->surface);
-	int stride = cairo_image_surface_get_stride(shadow.buf->surface);
-	for (int j = 0; j < size; j++) {
+	/* Cut out the shape itself, so a translucent surface on top does not
+	 * show its own shadow through it. */
+	window = rounded_rect_mask(bw, bh, pad, pad, w, h, radius);
+	unsigned char *px = cairo_image_surface_get_data(buf->surface);
+	int stride = cairo_image_surface_get_stride(buf->surface);
+	for (int j = 0; j < bh; j++) {
 		uint32_t *row = (uint32_t *)(px + j * stride);
-		for (int i = 0; i < size; i++) {
-			size_t k = (size_t)j * (size_t)size + (size_t)i;
+		for (int i = 0; i < bw; i++) {
+			size_t k = (size_t)j * (size_t)bw + (size_t)i;
 			float keep = window ? 1.0f - window[k] : 1.0f;
 			/* ARGB32 is premultiplied: the colour channels already carry a. */
 			uint32_t a = (uint32_t)lroundf(acc_a[k] * keep * 255.0f);
@@ -200,16 +199,31 @@ static void shadow_build(const struct gride_shadow_layer *layers) {
 			row[i] = a << 24 | r << 16 | g << 8 | b;
 		}
 	}
-	free(window);
-	cairo_surface_mark_dirty(shadow.buf->surface);
-	cairo_surface_flush(shadow.buf->surface);
+	cairo_surface_mark_dirty(buf->surface);
+	cairo_surface_flush(buf->surface);
 
 out:
+	free(window);
 	free(tmp);
 	free(acc_a);
 	for (int c = 0; c < 3; c++) {
 		free(acc_rgb[c]);
 	}
+	return buf;
+}
+
+static void shadow_build(const struct gride_shadow_layer *layers) {
+	const double radius = GRIDE_RADIUS_MD;
+	double inner_reach = 0;
+	for (int i = 0; i < GRIDE_SHADOW_FLOAT_LAYERS; i++) {
+		inner_reach = fmax(inner_reach, 1.5 * layers[i].blur);
+	}
+	shadow.pad = shadow_reach(layers);
+	int inner_corner = (int)ceil(inner_reach + radius);
+	shadow.corner = shadow.pad + inner_corner;
+	int inner = 2 * inner_corner + 2; /* a 2px stretchable middle */
+	shadow.size = 2 * shadow.pad + inner;
+	shadow.buf = shadow_render(inner, inner, radius, layers);
 }
 
 void deco_init_shared(struct gride_server *server) {

@@ -45,6 +45,10 @@ bool server_init(struct gride_server *server, const struct gride_options *opts) 
 	server->palette = opts->dark ? &gride_palette_dark : &gride_palette_light;
 	server->shadow = opts->dark ? gride_shadow_float_dark : gride_shadow_float_light;
 	server->deco_scale = 1.0f;
+	server->grid_columns = opts->grid_columns;
+	server->grid_rows = opts->grid_rows;
+	server->grid_mode = opts->grid_mode;
+	server->workspace = 0;
 	wl_list_init(&server->minimized);
 	/* Before anything draws text: makes the bundled Rubik visible. */
 	draw_init_fonts();
@@ -125,6 +129,7 @@ bool server_init(struct gride_server *server, const struct gride_options *opts) 
 	server->layers.windows = wlr_scene_tree_create(&server->scene->tree);
 	server->layers.unmanaged = wlr_scene_tree_create(&server->scene->tree);
 	server->layers.overlay = wlr_scene_tree_create(&server->scene->tree);
+	server->layers.flyouts = wlr_scene_tree_create(&server->scene->tree);
 
 	/* Registered after the scene exists: the handler draws into it. */
 	server->layout_change.notify = output_handle_layout_change;
@@ -178,6 +183,8 @@ bool server_start(struct gride_server *server) {
 	}
 	setenv("WAYLAND_DISPLAY", socket, true);
 	setenv("XDG_CURRENT_DESKTOP", "GriDE", true);
+	/* After WAYLAND_DISPLAY: a second instance names its socket after it. */
+	ipc_init(server);
 	wlr_log(WLR_INFO, "GriDE is running on WAYLAND_DISPLAY=%s", socket);
 
 	if (server->opts->startup_cmd) {
@@ -200,9 +207,12 @@ void server_finish(struct gride_server *server) {
 	if (!server->wl_display) {
 		return;
 	}
+	ipc_finish(server); /* no events to anyone during teardown */
+	flyout_finish(server);
 	xwayland_finish(server);
 	wl_display_destroy_clients(server->wl_display);
 	grid_finish(server);
+	workspace_finish(server);
 
 	if (server->sigint_source) {
 		wl_event_source_remove(server->sigint_source);

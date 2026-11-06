@@ -51,6 +51,27 @@ static bool handle_binding(struct gride_server *server, uint32_t mods, xkb_keysy
 				view_set_fullscreen(focused, !focused->fullscreen, NULL);
 			}
 			return true;
+		case XKB_KEY_z:
+			/* Snap layouts for the focused window; again to close. */
+			if (server->flyout) {
+				flyout_close(server);
+			} else if (focused) {
+				flyout_open(focused);
+				flyout_handle_key(server, XKB_KEY_Right); /* select the first zone */
+			}
+			return true;
+		case XKB_KEY_Left:
+			workspace_switch_direction(server, -1, 0);
+			return true;
+		case XKB_KEY_Right:
+			workspace_switch_direction(server, 1, 0);
+			return true;
+		case XKB_KEY_Up:
+			workspace_switch_direction(server, 0, -1);
+			return true;
+		case XKB_KEY_Down:
+			workspace_switch_direction(server, 0, 1);
+			return true;
 		default:
 			return false;
 		}
@@ -69,6 +90,13 @@ static bool handle_binding(struct gride_server *server, uint32_t mods, xkb_keysy
 	if (mods == (mod | WLR_MODIFIER_SHIFT)) {
 		if (dc || dr) {
 			grid_move_view(focused, dc, dr);
+			return true;
+		}
+		if (sym >= XKB_KEY_1 && sym <= XKB_KEY_9) {
+			/* Send the window to workspace 1-9; you stay where you are. */
+			if (focused) {
+				workspace_move_view(focused, (int)(sym - XKB_KEY_1));
+			}
 			return true;
 		}
 		if (sym == XKB_KEY_m) {
@@ -134,6 +162,10 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 		int n = xkb_state_key_get_syms(state, keycode, &translated);
 		for (int i = 0; i < n && !handled; i++) {
 			handled = handle_vt_switch(server, translated[i]);
+		}
+		/* An open flyout takes its keys (arrows, Enter, Escape) first. */
+		for (int i = 0; i < n && !handled && server->flyout; i++) {
+			handled = mods == 0 && flyout_handle_key(server, translated[i]);
 		}
 
 		const xkb_keysym_t *raw;
