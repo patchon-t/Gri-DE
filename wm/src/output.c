@@ -51,6 +51,7 @@ static void output_handle_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&output->request_state.link);
 	wl_list_remove(&output->destroy.link);
 	wl_list_remove(&output->link);
+	grid_output_removed(output->server, output->wlr_output);
 	/* The scene output and the layout entry are destroyed by wlroots
 	 * itself: both listen to this same wlr_output's destroy signal. */
 	background_destroy(output->background);
@@ -120,12 +121,20 @@ void output_handle_new(struct wl_listener *listener, void *data) {
 void output_handle_layout_change(struct wl_listener *listener, void *data) {
 	struct gride_server *server = wl_container_of(listener, server, layout_change);
 	struct gride_output *output;
+	float scale = 1.0f;
 	wl_list_for_each(output, &server->outputs, link) {
 		struct wlr_box box;
 		wlr_output_layout_get_box(server->output_layout, output->wlr_output, &box);
 		if (output->background && !wlr_box_empty(&box)) {
 			background_update(output->background, server->palette, output->wlr_output, &box);
 		}
+		if (output->wlr_output->scale > scale) {
+			scale = output->wlr_output->scale;
+		}
+	}
+	if (scale != server->deco_scale) {
+		server->deco_scale = scale;
+		views_redraw_decorations(server);
 	}
 	views_arrange(server);
 }

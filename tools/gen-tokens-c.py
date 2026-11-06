@@ -83,6 +83,46 @@ def main():
             w(f"#define GRIDE_{c_name(t['name']).upper()} {int(round(v))}")
         w("")
 
+    # Type styles: family list (Pango accepts comma-separated families),
+    # size and line height in px, and weight.
+    families = {k: ",".join(f.strip().strip('"') for f in v.split(","))
+                for k, v in tokens["type"]["families"].items()}
+    w("struct gride_type_style {")
+    w("\tconst char *family;")
+    w("\tint size, line_height, weight;")
+    w("};")
+    w("")
+    for group in tokens["type"]["groups"]:
+        fam = families[group["family"]]
+        for st in group["styles"]:
+            w(f"static const struct gride_type_style gride_type_{c_name(st['name'])} = "
+              f"{{ \"{fam}\", {int(px(st['fontSize']))}, {int(px(st['lineHeight']))}, "
+              f"{int(st['fontWeight'])} }};")
+    w("")
+
+    # The one shadow, as layers of (x, y, blur, colour) per theme.
+    w("struct gride_shadow_layer {")
+    w("\tfloat x, y, blur;")
+    w("\tfloat color[4];")
+    w("};")
+    w("")
+    shadow = next(t for t in tokens["shadow"]["tokens"] if t["name"] == "shadow-float")
+    layer_re = re.compile(r"(-?[\d.]+)(?:px)?\s+(-?[\d.]+)(?:px)?\s+([\d.]+)(?:px)?\s+(rgba?\([^)]*\)|#[0-9a-fA-F]+)")
+    counts = set()
+    for theme in themes:
+        layers = layer_re.findall(shadow["value"][theme])
+        counts.add(len(layers))
+        w(f"static const struct gride_shadow_layer gride_shadow_float_{c_name(theme)}[] = {{")
+        for x, y, blur, col in layers:
+            r, g, b, a = parse_colour(col)
+            w(f"\t{{ {float(x)}f, {float(y)}f, {float(blur)}f, "
+              f"{{ {r:.6f}f, {g:.6f}f, {b:.6f}f, {a:.6f}f }} }},")
+        w("};")
+    if len(counts) != 1:
+        raise ValueError("shadow-float must have the same number of layers in every theme")
+    w(f"#define GRIDE_SHADOW_FLOAT_LAYERS {counts.pop()}")
+    w("")
+
     w("#endif")
     with open(sys.argv[2], "w", encoding="utf-8") as f:
         f.write("\n".join(out) + "\n")

@@ -55,10 +55,36 @@ static bool handle_binding(struct gride_server *server, uint32_t mods, xkb_keysy
 			return false;
 		}
 	}
-	if (mods == (mod | WLR_MODIFIER_SHIFT) && sym == XKB_KEY_Escape) {
-		/* Leave GriDE. Phase 7 puts a confirmation in front of this. */
-		wlr_log(WLR_INFO, "Exit requested from the keyboard");
-		wl_display_terminate(server->wl_display);
+
+	/* Super+Shift+Arrow moves the window one cell; Super+Ctrl+Arrow moves
+	 * its right or bottom edge one cell (grow or shrink). */
+	int dc = 0, dr = 0;
+	switch (sym) {
+	case XKB_KEY_Left: dc = -1; break;
+	case XKB_KEY_Right: dc = 1; break;
+	case XKB_KEY_Up: dr = -1; break;
+	case XKB_KEY_Down: dr = 1; break;
+	default: break;
+	}
+	if (mods == (mod | WLR_MODIFIER_SHIFT)) {
+		if (dc || dr) {
+			grid_move_view(focused, dc, dr);
+			return true;
+		}
+		if (sym == XKB_KEY_m) {
+			/* Until the taskbar (phase 4) can restore windows. */
+			view_restore_last_minimized(server);
+			return true;
+		}
+		if (sym == XKB_KEY_Escape) {
+			/* Leave GriDE. Phase 7 puts a confirmation in front of this. */
+			wlr_log(WLR_INFO, "Exit requested from the keyboard");
+			wl_display_terminate(server->wl_display);
+			return true;
+		}
+	}
+	if (mods == (mod | WLR_MODIFIER_CTRL) && (dc || dr)) {
+		grid_resize_view(focused, dc, dr);
 		return true;
 	}
 	return false;
@@ -99,7 +125,8 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 
 	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
 		struct xkb_state *state = keyboard->wlr_keyboard->xkb_state;
-		/* Caps Lock and Num Lock (Mod2) never change what a binding means. */
+		/* This keyboard's own modifiers; Caps Lock and Num Lock never
+		 * change what a binding means. */
 		uint32_t mods = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard) &
 			~(uint32_t)(WLR_MODIFIER_CAPS | WLR_MODIFIER_MOD2);
 
@@ -118,6 +145,10 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 		}
 	}
 
+	/* Ctrl pressed or released during a drag shows or hides the snap target. */
+	if (server->grid_overlay) {
+		grid_drag_update(server);
+	}
 	if (!handled) {
 		wlr_seat_set_keyboard(seat, keyboard->wlr_keyboard);
 		wlr_seat_keyboard_notify_key(seat, event->time_msec, event->keycode, event->state);
@@ -266,6 +297,17 @@ void input_finish(struct gride_server *server) {
 	wl_list_remove(&server->new_virtual_pointer.link);
 }
 
+/* Modifiers on the seat's keyboard. Caps Lock and Num Lock (Mod2) are left
+ * out: they never change what a binding means. */
+uint32_t input_current_modifiers(struct gride_server *server) {
+	struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(server->seat);
+	if (!keyboard) {
+		return 0;
+	}
+	return wlr_keyboard_get_modifiers(keyboard) &
+		~(uint32_t)(WLR_MODIFIER_CAPS | WLR_MODIFIER_MOD2);
+}
+
 /* ---- seat requests ------------------------------------------------------ */
 
 void seat_handle_request_cursor(struct wl_listener *listener, void *data) {
@@ -275,6 +317,7 @@ void seat_handle_request_cursor(struct wl_listener *listener, void *data) {
 	if (server->seat->pointer_state.focused_client == event->seat_client) {
 		wlr_cursor_set_surface(server->cursor, event->surface,
 			event->hotspot_x, event->hotspot_y);
+		server->cursor_image = NULL; /* ours is no longer showing */
 	}
 }
 
